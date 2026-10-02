@@ -6,6 +6,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const extractor = new SpotdlExtractor();
 
+// Crucial on Render: trust the reverse proxy to get correct protocol & host
+app.set('trust proxy', 1);
+
 app.use(express.json());
 
 // Request logger
@@ -17,12 +20,11 @@ app.use((req, res, next) => {
   next();
 });
 
+// Health check endpoint for Render
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 /**
- * Encodes URI components strictly according to RFC 3986,
- * ensuring characters like !, ', (, ), * are percent-encoded
- * to avoid terminal shell expansion and client-side URL parsing issues.
+ * Encodes URI components strictly according to RFC 3986.
  */
 function encodeRFC3986(str) {
   return encodeURIComponent(str || '')
@@ -40,7 +42,9 @@ async function handlePlaylist(req, res) {
 
   try {
     const { title, tracks } = await extractor.getPlaylist(playlistUrl);
-    const baseUrl = `${req.headers['x-forwarded-proto'] || req.protocol}://${req.get('host')}`;
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.get('host');
+    const baseUrl = `${protocol}://${host}`;
 
     const streamableTracks = tracks.map((track) => {
       const qTitle = `title=${encodeRFC3986(track.title)}`;
@@ -55,10 +59,10 @@ async function handlePlaylist(req, res) {
       };
     });
 
-    res.json({ title, count: streamableTracks.length, tracks: streamableTracks });
+    return res.json({ title, count: streamableTracks.length, tracks: streamableTracks });
   } catch (err) {
     console.error(`[Playlist Error] ${err.message}`);
-    res.status(502).json({ error: 'Extraction Failed', message: err.message });
+    return res.status(502).json({ error: 'Extraction Failed', message: err.message });
   }
 }
 
@@ -74,30 +78,54 @@ async function handleAudioStream(req, res) {
     return res.status(400).json({ error: 'Missing "title" parameter.' });
   }
 
+  let cleanupStream = null;
+
   try {
     const match = await findBestMatch({ title, author, targetDuration: duration });
     const { stream, cleanup } = await getAudioStream(match.url, { title, author });
+    cleanupStream = cleanup;
 
-    // Clean filename: remove illegal filesystem characters and normalize spaces
-    const safeFilename = `${author ? `${author} - ` : ''}${title}.opus`
+    // Sanitize base ASCII filename and prepare full UTF-8 filename
+    const rawFilename = author ? `${author} - ${title}.opus` : `${title}.opus`;
+    const cleanFilename = rawFilename
       .replace(/[\\/:*?"<>|]/g, '_')
       .replace(/\s+/g, ' ')
       .trim();
 
+    // Standard RFC 5987 / RFC 6266 header handling UTF-8 characters safely
+    const asciiFallback = cleanFilename.replace(/[^\x20-\x7E]/g, '_');
+    const encodedFilename = encodeURIComponent(cleanFilename);
+
     res.setHeader('Content-Type', 'audio/opus');
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeFilename)}"`);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`
+    );
+
+    // Clean up when client aborts the request
+    req.on('close', () => {
+      if (!res.writableEnded && cleanupStream) {
+        cleanupStream();
+      }
+    });
 
     stream.on('error', (err) => {
       console.error('[Stream Error]', err);
-      cleanup();
-      if (!res.headersSent) res.status(500).json({ error: 'Stream interrupted' });
+      if (cleanupStream) cleanupStream();
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Stream interrupted' });
+      } else {
+        res.end();
+      }
     });
 
-    req.on('close', cleanup);
     stream.pipe(res);
   } catch (err) {
     console.error('[Match Error]', err.message);
-    res.status(404).json({ error: 'Track not found', message: err.message });
+    if (cleanupStream) cleanupStream();
+    if (!res.headersSent) {
+      return res.status(404).json({ error: 'Track not found', message: err.message });
+    }
   }
 }
 
@@ -105,6 +133,23 @@ async function handleAudioStream(req, res) {
 app.route('/api/playlist').get(handlePlaylist).post(handlePlaylist);
 app.route('/api/stream').get(handleAudioStream).post(handleAudioStream);
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Backend running on http://0.0.0.0:${PORT}`);
 });
+
+// Graceful shutdown handling for container stops (Render/Docker)
+const shutdown = (signal) => {
+  console.log(`Received ${signal}. Shutting down cleanly...`);
+  server.close(() => {
+    console.log('HTTP server closed.');
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error('Forcing shutdown after timeout.');
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
