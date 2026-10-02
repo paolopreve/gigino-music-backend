@@ -7,8 +7,7 @@ const execFileAsync = promisify(execFile);
 const YT_DLP_PATH = '/usr/local/bin/yt-dlp';
 
 /**
- * Resolves the path to a writable cookies file.
- * Copies read-only secret (/etc/secrets/cookies.txt) to /tmp to prevent OSError 30.
+ * Resolves a writable path for the cookies file.
  */
 function getCookieFilePath() {
   const secretPath = '/etc/secrets/cookies.txt';
@@ -36,7 +35,9 @@ function getCookieFilePath() {
 }
 
 /**
- * Base yt-dlp arguments for headless cloud environments.
+ * Base arguments for cloud instances:
+ * - Uses ios and web clients (avoids android SABR empty stream locks)
+ * - Enables node runtime for signature descrambling
  */
 function getBaseYtDlpArgs() {
   const args = [
@@ -44,7 +45,7 @@ function getBaseYtDlpArgs() {
     '--no-cache-dir',
     '--js-runtimes', 'node',
     '--remote-components', 'ejs:github',
-    '--extractor-args', 'youtube:player_client=android,web'
+    '--extractor-args', 'youtube:player_client=ios,web,mweb'
   ];
 
   const cookiePath = getCookieFilePath();
@@ -56,7 +57,7 @@ function getBaseYtDlpArgs() {
 }
 
 /**
- * Searches YouTube and finds the best matching track.
+ * Searches YouTube and returns metadata for the closest match.
  */
 export async function findBestMatch({ title, author, targetDuration = 0 }) {
   const query = `ytsearch15:${title} ${author} audio`;
@@ -111,27 +112,25 @@ export async function findBestMatch({ title, author, targetDuration = 0 }) {
 }
 
 /**
- * Streams audio with Title and Artist Vorbis tags embedded via FFmpeg.
+ * Pipes audio directly from yt-dlp -> FFmpeg -> HTTP Response.
+ * This completely avoids the fragile '-g' URL extraction step.
  */
 export async function getAudioStream(videoUrl, { title, author } = {}) {
-  // 1. Fetch direct audio URL using relaxed format selection (ba/b)
-  const args = [
-    ...getBaseYtDlpArgs(),
-    '-g',
-    '-f', 'ba/b',
-    videoUrl
-  ];
+  // 1. Spawn yt-dlp to stream raw audio bytes directly to stdout
+  const ytDlpProcess = spawn(
+    YT_DLP_PATH,
+    [
+      ...getBaseYtDlpArgs(),
+      '-f', 'ba/b',
+      '-o', '-', // Stream directly to pipe
+      videoUrl
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] }
+  );
 
-  const { stdout } = await execFileAsync(YT_DLP_PATH, args);
-  const directAudioUrl = stdout.trim().split('\n')[0].trim();
-
-  // 2. FFmpeg transcode & remuxing arguments
-  // Using -c:a libopus ensures any source format (AAC/m4a/opus) converts safely into Opus
+  // 2. Spawn FFmpeg to read from yt-dlp's stdout (pipe:0) and encode to Opus
   const ffmpegArgs = [
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-    '-i', directAudioUrl,
+    '-i', 'pipe:0',
     '-vn',
     '-c:a', 'libopus',
     '-b:a', '160k',
@@ -141,27 +140,48 @@ export async function getAudioStream(videoUrl, { title, author } = {}) {
     'pipe:1'
   ];
 
-  const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
-    stdio: ['ignore', 'pipe', 'pipe']
+  const ffmpegProcess = spawn('ffmpeg', ffmpegArgs, {
+    stdio: ['pipe', 'pipe', 'pipe']
   });
 
-  ffmpeg.on('error', (err) => {
-    console.error('[FFmpeg Process Error]', err.message);
-  });
+  // Pipe raw media bytes from yt-dlp directly into FFmpeg
+  ytDlpProcess.stdout.pipe(ffmpegProcess.stdin);
 
-  ffmpeg.stderr.on('data', (data) => {
-    const str = data.toString();
-    if (str.includes('Error') || str.includes('Invalid')) {
-      console.error('[FFmpeg STDERR]', str.trim());
+  ytDlpProcess.stderr.on('data', (data) => {
+    const msg = data.toString();
+    if (msg.includes('ERROR') || msg.includes('WARNING')) {
+      console.warn('[yt-dlp]', msg.trim());
     }
+  });
+
+  ffmpegProcess.stderr.on('data', (data) => {
+    const msg = data.toString();
+    if (msg.includes('Error') || msg.includes('Invalid')) {
+      console.error('[FFmpeg]', msg.trim());
+    }
+  });
+
+  const cleanup = () => {
+    try {
+      ytDlpProcess.kill('SIGTERM');
+    } catch (_) {}
+    try {
+      ffmpegProcess.kill('SIGTERM');
+    } catch (_) {}
+  };
+
+  ytDlpProcess.on('error', (err) => {
+    console.error('[yt-dlp Spawn Error]', err.message);
+    cleanup();
+  });
+
+  ffmpegProcess.on('error', (err) => {
+    console.error('[FFmpeg Spawn Error]', err.message);
+    cleanup();
   });
 
   return {
-    stream: ffmpeg.stdout,
-    cleanup: () => {
-      try {
-        ffmpeg.kill('SIGTERM');
-      } catch (_) {}
-    }
+    stream: ffmpegProcess.stdout,
+    cleanup
   };
 }
