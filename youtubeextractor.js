@@ -8,9 +8,7 @@ const YT_DLP_PATH = '/usr/local/bin/yt-dlp';
 
 /**
  * Resolves the path to a writable cookies file.
- * Render secret files (/etc/secrets/cookies.txt) are mounted as read-only.
- * yt-dlp attempts to write back updated tokens upon exit, which throws OSError 30.
- * We copy the file to /tmp so yt-dlp has full read/write access.
+ * Copies read-only secret (/etc/secrets/cookies.txt) to /tmp to prevent OSError 30.
  */
 function getCookieFilePath() {
   const secretPath = '/etc/secrets/cookies.txt';
@@ -22,17 +20,14 @@ function getCookieFilePath() {
     (p) => p && fs.existsSync(p)
   );
 
-  if (!sourcePath) {
-    return null;
-  }
+  if (!sourcePath) return null;
 
-  // If the source is in /etc/secrets or read-only, duplicate it to /tmp
   if (sourcePath.startsWith('/etc/secrets')) {
     try {
       fs.copyFileSync(sourcePath, writableTmpPath);
       return writableTmpPath;
     } catch (err) {
-      console.warn('[Cookies] Failed copying to /tmp, using source path:', err.message);
+      console.warn('[Cookies] Failed copying to /tmp:', err.message);
       return sourcePath;
     }
   }
@@ -41,8 +36,7 @@ function getCookieFilePath() {
 }
 
 /**
- * Returns baseline yt-dlp arguments required to satisfy YouTube JS challenges
- * and bypass bot-detection on cloud servers without triggering read-only filesystem errors.
+ * Base yt-dlp arguments for headless cloud environments.
  */
 function getBaseYtDlpArgs() {
   const args = [
@@ -120,26 +114,27 @@ export async function findBestMatch({ title, author, targetDuration = 0 }) {
  * Streams audio with Title and Artist Vorbis tags embedded via FFmpeg.
  */
 export async function getAudioStream(videoUrl, { title, author } = {}) {
-  // 1. Fetch direct audio URL
+  // 1. Fetch direct audio URL using relaxed format selection (ba/b)
   const args = [
     ...getBaseYtDlpArgs(),
     '-g',
-    '-f', 'bestaudio[ext=opus]/bestaudio/best',
+    '-f', 'ba/b',
     videoUrl
   ];
 
   const { stdout } = await execFileAsync(YT_DLP_PATH, args);
-  // Ensure we grab only the first stream line if yt-dlp outputs both video and audio URLs
   const directAudioUrl = stdout.trim().split('\n')[0].trim();
 
-  // 2. FFmpeg remuxing arguments
+  // 2. FFmpeg transcode & remuxing arguments
+  // Using -c:a libopus ensures any source format (AAC/m4a/opus) converts safely into Opus
   const ffmpegArgs = [
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '5',
     '-i', directAudioUrl,
     '-vn',
-    '-c:a', 'copy',
+    '-c:a', 'libopus',
+    '-b:a', '160k',
     ...(title ? ['-metadata', `title=${title}`] : []),
     ...(author ? ['-metadata', `artist=${author}`] : []),
     '-f', 'opus',
