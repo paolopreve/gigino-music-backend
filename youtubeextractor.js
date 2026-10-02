@@ -1,8 +1,49 @@
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
 
 const execFileAsync = promisify(execFile);
 const YT_DLP_PATH = '/usr/local/bin/yt-dlp';
+
+/**
+ * Resolves the path to the cookies file if present.
+ * Looks for Render's secret path first (/etc/secrets/cookies.txt), then local root.
+ */
+function getCookieFilePath() {
+  const possiblePaths = [
+    process.env.YOUTUBE_COOKIES_PATH,
+    '/etc/secrets/cookies.txt',
+    path.join(process.cwd(), 'cookies.txt')
+  ];
+
+  for (const filePath of possiblePaths) {
+    if (filePath && fs.existsSync(filePath)) {
+      return filePath;
+    }
+  }
+  return null;
+}
+
+/**
+ * Returns baseline yt-dlp arguments required to satisfy YouTube JS challenges
+ * and bypass bot-detection on cloud servers.
+ */
+function getBaseYtDlpArgs() {
+  const args = [
+    '--no-warnings',
+    '--js-runtimes', 'node',
+    '--remote-components', 'ejs:github',
+    '--extractor-args', 'youtube:player_client=android,web'
+  ];
+
+  const cookiePath = getCookieFilePath();
+  if (cookiePath) {
+    args.push('--cookies', cookiePath);
+  }
+
+  return args;
+}
 
 /**
  * Searches YouTube and finds the best matching track.
@@ -11,16 +52,18 @@ export async function findBestMatch({ title, author, targetDuration = 0 }) {
   const query = `ytsearch15:${title} ${author} audio`;
   console.log(`[YouTube Search] Query: "${query}"`);
 
-  const { stdout } = await execFileAsync(YT_DLP_PATH, [
+  const args = [
+    ...getBaseYtDlpArgs(),
     query,
     '--dump-single-json',
-    '--flat-playlist',
-    '--no-warnings'
-  ]);
+    '--flat-playlist'
+  ];
+
+  const { stdout } = await execFileAsync(YT_DLP_PATH, args);
 
   const { entries = [] } = JSON.parse(stdout);
   if (entries.length === 0) {
-    throw new Error(`No YouTube results for: "${title} - ${author}"`);
+    throw new Error(`No YouTube results for: "${title} ${author}"`);
   }
 
   const normAuthor = (author || '').toLowerCase().trim();
@@ -62,11 +105,14 @@ export async function findBestMatch({ title, author, targetDuration = 0 }) {
  */
 export async function getAudioStream(videoUrl, { title, author } = {}) {
   // 1. Fetch direct audio URL
-  const { stdout } = await execFileAsync(YT_DLP_PATH, [
+  const args = [
+    ...getBaseYtDlpArgs(),
     '-g',
     '-f', 'bestaudio[ext=opus]/bestaudio/best',
     videoUrl
-  ]);
+  ];
+
+  const { stdout } = await execFileAsync(YT_DLP_PATH, args);
   const directAudioUrl = stdout.trim();
 
   // 2. FFmpeg remuxing arguments
@@ -93,7 +139,6 @@ export async function getAudioStream(videoUrl, { title, author } = {}) {
   });
 
   ffmpeg.stderr.on('data', (data) => {
-    // Only log if FFmpeg prints an actual error
     const str = data.toString();
     if (str.includes('Error') || str.includes('Invalid')) {
       console.error('[FFmpeg STDERR]', str.trim());
