@@ -7,31 +7,47 @@ const execFileAsync = promisify(execFile);
 const YT_DLP_PATH = '/usr/local/bin/yt-dlp';
 
 /**
- * Resolves the path to the cookies file if present.
- * Looks for Render's secret path first (/etc/secrets/cookies.txt), then local root.
+ * Resolves the path to a writable cookies file.
+ * Render secret files (/etc/secrets/cookies.txt) are mounted as read-only.
+ * yt-dlp attempts to write back updated tokens upon exit, which throws OSError 30.
+ * We copy the file to /tmp so yt-dlp has full read/write access.
  */
 function getCookieFilePath() {
-  const possiblePaths = [
-    process.env.YOUTUBE_COOKIES_PATH,
-    '/etc/secrets/cookies.txt',
-    path.join(process.cwd(), 'cookies.txt')
-  ];
+  const secretPath = '/etc/secrets/cookies.txt';
+  const writableTmpPath = '/tmp/yt_cookies.txt';
+  const envPath = process.env.YOUTUBE_COOKIES_PATH;
+  const localPath = path.join(process.cwd(), 'cookies.txt');
 
-  for (const filePath of possiblePaths) {
-    if (filePath && fs.existsSync(filePath)) {
-      return filePath;
+  const sourcePath = [envPath, secretPath, localPath].find(
+    (p) => p && fs.existsSync(p)
+  );
+
+  if (!sourcePath) {
+    return null;
+  }
+
+  // If the source is in /etc/secrets or read-only, duplicate it to /tmp
+  if (sourcePath.startsWith('/etc/secrets')) {
+    try {
+      fs.copyFileSync(sourcePath, writableTmpPath);
+      return writableTmpPath;
+    } catch (err) {
+      console.warn('[Cookies] Failed copying to /tmp, using source path:', err.message);
+      return sourcePath;
     }
   }
-  return null;
+
+  return sourcePath;
 }
 
 /**
  * Returns baseline yt-dlp arguments required to satisfy YouTube JS challenges
- * and bypass bot-detection on cloud servers.
+ * and bypass bot-detection on cloud servers without triggering read-only filesystem errors.
  */
 function getBaseYtDlpArgs() {
   const args = [
     '--no-warnings',
+    '--no-cache-dir',
     '--js-runtimes', 'node',
     '--remote-components', 'ejs:github',
     '--extractor-args', 'youtube:player_client=android,web'
@@ -113,7 +129,8 @@ export async function getAudioStream(videoUrl, { title, author } = {}) {
   ];
 
   const { stdout } = await execFileAsync(YT_DLP_PATH, args);
-  const directAudioUrl = stdout.trim();
+  // Ensure we grab only the first stream line if yt-dlp outputs both video and audio URLs
+  const directAudioUrl = stdout.trim().split('\n')[0].trim();
 
   // 2. FFmpeg remuxing arguments
   const ffmpegArgs = [
@@ -133,7 +150,6 @@ export async function getAudioStream(videoUrl, { title, author } = {}) {
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
-  // Prevent unhandled error events from crashing the Node server
   ffmpeg.on('error', (err) => {
     console.error('[FFmpeg Process Error]', err.message);
   });
